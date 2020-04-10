@@ -1,110 +1,163 @@
-/*
- * Loader Implementation
- *
- * 2018, Operating Systems
- */
-#include <signal.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <string.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "exec_parser.h"
 
 static so_exec_t *exec;
-static struct sigaction def_action;
-int page_size;
-int file_des;
-char *page_idx;
+static struct sigaction old_action;
+static int page_size;
+static int file_des;
 
-void signal_handler(int signum, siginfo_t *info, void *context) {
-	void *address, *tmp;
-	int faulty = -1;
-	int number_of_pages;
-	int culprit;
-	int size_helper;
+static int get_segment(uintptr_t faulty)
+{
+	int result = -1;
 
-	// checking the signal
-	if (signum != SIGSEGV) {
-		def_action.sa_sigaction(signum, info, context);
-		// return;
-	}
-
-	// getting the address at which there is a page fault
-	address = info->si_addr;
-
-	// there are multiple segments which must be checked for faults 
 	for (int i = 0; i < exec->segments_no; ++i) {
-		if (*(int *)address >= exec->segments[i].vaddr && 
-			*(int *)address < (exec->segments[i].vaddr + exec->segments[i].mem_size)) {
-			faulty = i;
+		int start_segment = exec->segments[i].vaddr;
+		int end_segment = exec->segments[i].mem_size + start_segment;
+
+		if (faulty >= start_segment && faulty < end_segment) {
+			result = i;
+			break;
 		}
 	}
-
-	if (faulty != -1) {
-		// calculating the page for the address, taking the segment into account
-		number_of_pages = (exec->segments[faulty].mem_size) / page_size;
-		culprit = ((int) address - exec->segments[faulty].vaddr) / page_size;
-
-		// checking for memory left on the side
-		if (exec->segments[faulty].mem_size % page_size) {number_of_pages++;}
-		if (!exec->segments[faulty].data) {
-			exec->segments[faulty].data = calloc(number_of_pages, 1);
-		}
-
-		if (((int)exec->segments[faulty].data + culprit) == 1) {
-			def_action.sa_sigaction(signum, info, context);
-		} else {
-			size_helper = page_size * culprit;
-			memset(exec->segments[faulty].data + culprit, 1, 1);
-			tmp = mmap((void *)exec->segments[faulty].vaddr + size_helper, page_size, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			lseek(file_des, (void *)exec->segments[faulty].offset + size_helper, SEEK_SET);
-			read(file_des, exec->segments[faulty].vaddr + size_helper, page_size);
-			mprotect(tmp, page_size, exec->segments[faulty].perm);
-			memset((void *)exec->segments[faulty].vaddr + exec->segments[faulty].file_size, 0, exec->segments[faulty].mem_size - exec->segments[faulty].file_size);
-			free(exec->segments[faulty].data);
-		}
-	} else {
-		def_action.sa_sigaction(signum, info, context);
-		return;
-	}
-		
+	return result;
 }
 
+static void signal_handler(int signum, siginfo_t *info, void *context)
+{
+	char *p, *validate;
+	uintptr_t page_fault_addr;
+	int page_fault_segment;
+
+	page_fault_addr = (uintptr_t)info->si_addr;
+
+	page_fault_segment = get_segment(page_fault_addr);
+
+	if (page_fault_segment == -1)
+		old_action.sa_sigaction(signum, info, context);
+
+
+	uintptr_t culprit =
+	 (page_fault_addr - exec->segments[page_fault_segment].vaddr) /
+	  page_size;
+
+	validate = (char *)exec->segments[page_fault_segment].data;
+	if (validate[culprit] != 1) {
+		validate[culprit] = 1;
+
+		int size_helper = page_size * culprit;
+		int size_to_read =
+		 size_helper + page_size -
+		 exec->segments[page_fault_segment].file_size;
+		int mem_size =
+		 size_helper + page_size -
+		 exec->segments[page_fault_segment].mem_size;
+
+		if (size_to_read > 0) {
+			size_to_read =
+			 exec->segments[page_fault_segment].file_size -
+			 size_helper;
+			if (size_to_read < 0)
+				size_to_read = 0;
+
+		} else
+			size_to_read = page_size;
+
+		if (mem_size < 0)
+			mem_size =
+			 exec->segments[page_fault_segment].mem_size %
+			 page_size;
+
+		else
+			mem_size = page_size;
+
+		if (size_to_read != 0) {
+			p = mmap(
+			(void *)exec->segments[page_fault_segment].vaddr +
+			 size_helper,
+			 page_size,
+			 PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+			 -1,
+			 0
+			 );
+
+			lseek(
+			 file_des,
+			 exec->segments[page_fault_segment].offset +
+			 size_helper,
+			 SEEK_SET
+			 );
+			read(file_des, p, size_to_read);
+
+			if (mem_size - size_to_read > 0)
+				memset(p + size_to_read,
+				 0,
+				 page_size - size_to_read);
+
+			mprotect(
+			 p,
+			 page_size,
+			 exec->segments[page_fault_segment].perm
+			 );
+
+		} else
+			p = mmap(
+			 (void *)exec->segments[page_fault_segment].vaddr +
+			 size_helper,
+			 page_size,
+			 exec->segments[page_fault_segment].perm,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+			 -1,
+			 0
+			 );
+		return;
+	}
+	old_action.sa_sigaction(signum, info, context);
+}
 
 int so_init_loader(void)
 {
-	/* TODO: initialize on-demand loader */
 	struct sigaction my_action;
+	int check;
 
 	my_action.sa_sigaction = signal_handler;
-	// initializing action
 	sigemptyset(&my_action.sa_mask);
-	// setting signal
 	sigaddset(&my_action.sa_mask, SIGSEGV);
 	my_action.sa_flags = SA_SIGINFO;
 
-	int check = sigaction(SIGSEGV, &my_action, &def_action);
-	// DIE(check == -1, "SIGSEGV action");
+	check = sigaction(SIGSEGV, &my_action, &old_action);
+	if (check == -1)
+		fprintf(stderr, "error in sigaction\n");
+
 	return 0;
 }
 
 int so_execute(char *path, char *argv[])
 {
-	// opening the file
+	int i, number_of_pages;
+
 	file_des = open(path, O_RDONLY);
-	page_size = getpagesize();
 
 	exec = so_parse_exec(path);
 	if (!exec)
 		return -1;
 
-	// load & exec
+	page_size = getpagesize();
+
+	for (i = 0; i < exec->segments_no; i++) {
+		number_of_pages = exec->segments[i].mem_size / page_size + 1;
+		exec->segments[i].data = calloc(number_of_pages, sizeof(char));
+	}
+
 	so_start_exec(exec, argv);
-	so_init_loader();
- 	// closing the file after the job is done
- 	close(file_des);
+
+	close(file_des);
 	return 0;
 }
